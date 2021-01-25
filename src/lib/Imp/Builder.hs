@@ -29,16 +29,16 @@ import Util (bindM2)
 
 -- XXX: Scope is actually global within each function
 data IBuilderEnv = IBuilderEnv
-  { scope :: Env ()
-  , blockDecls :: Nest ImpDecl
+  { scope :: Scope ()
+  , blockDecls :: [ImpDecl]
   }
 data ISubstEnv = ISubstEnv
-  { valSubst  :: Env IExpr
-  , funcSubst :: Env IFunVar
+  { valSubst  :: SimpleEnv () IExpr
+  , funcSubst :: SimpleEnv () IFunVar
   }
 
 type IBuilderT      m = CatT IBuilderEnv m
-type ISubstT      m = ReaderT ISubstEnv m
+type ISubstT        m = ReaderT ISubstEnv m
 type ISubstBuilderT m = IBuilderT (ISubstT m)
 
 runIBuilderT :: Monad m => IBuilderT m a -> m a
@@ -53,18 +53,20 @@ runISubstBuilderT env = (runISubstT env) . runIBuilderT
 liftSE :: Monad m => m a -> ISubstBuilderT m a
 liftSE = lift . lift
 
-extendScope :: Monad m => Env a -> IBuilderT m ()
-extendScope s = extend $ IBuilderEnv (fmap (const ()) s) mempty
+extendScope :: Monad m => SimpleEnv () a -> IBuilderT m ()
+extendScope s = undefined -- extend $ IBuilderEnv (fmap (const ()) s) mempty
 
 emit :: Monad m => ImpInstr -> IBuilderT m [IExpr]
-emit instr = do
-  vs <- traverse (freshIVar . Ignore) $ impInstrTypes instr
-  emitTo vs instr
+emit = undefined
+-- emit instr = do
+--   vs <- traverse (freshIVar . ("v"::NameStr,)) $ impInstrTypes instr
+--   emitTo vs instr
 
 emitTo :: Monad m => [IVar] -> ImpInstr -> IBuilderT m [IExpr]
-emitTo bs instr = do
-  extend $ mempty { blockDecls = (Nest (ImpLet (fmap Bind bs) instr) Empty) }
-  return $ fmap IVar bs
+emitTo = undefined
+-- emitTo bs instr = do
+--   extend $ mempty { blockDecls = [ImpLet bs instr] }
+--   return $ fmap IVar bs
 
 instance Semigroup IBuilderEnv where
   (IBuilderEnv s d) <> (IBuilderEnv s' d') = IBuilderEnv (s <> s') (d <> d')
@@ -94,7 +96,7 @@ alloc addrSpc ty size = liftM head $ emit $ Alloc addrSpc ty size
 
 -- === Imp IR traversal ===
 
-type ITraversalDef m = ( ImpDecl  -> ISubstBuilderT m (Env IExpr)
+type ITraversalDef m = ( ImpDecl  -> ISubstBuilderT m (SimpleEnv () IExpr)
                        , ImpInstr -> ISubstBuilderT m ImpInstr
                        )
 
@@ -103,26 +105,24 @@ substTraversalDef = ( traverseImpDecl  substTraversalDef
                     , traverseImpInstr substTraversalDef )
 
 traverseImpModule :: forall m. Monad m
-                  => (Env IFunVar -> ImpFunction -> m ImpFunction) -> ImpModule -> m ImpModule
+                  => (SimpleEnv () IFunVar -> ImpFunction -> m ImpFunction) -> ImpModule -> m ImpModule
 traverseImpModule fTrav (ImpModule funcs) = ImpModule . fst <$> runCatT (traverse go funcs) mempty
   where
-    go :: ImpFunction -> CatT (Env IFunVar) m ImpFunction
+    go :: ImpFunction -> CatT (SimpleEnv () IFunVar) m ImpFunction
     go f = do
       fenv <- look
       f' <- lift $ fTrav fenv f
-      extend $ impFunVar f @> impFunVar f'
+      extend $ fst (impFunVar f) @> HLift (impFunVar f')
       return f'
 
-traverseImpFunction :: Monad m => ITraversalDef m -> Env IFunVar -> ImpFunction -> m ImpFunction
+traverseImpFunction :: Monad m => ITraversalDef m -> SimpleEnv () IFunVar -> ImpFunction -> m ImpFunction
 traverseImpFunction _   _    (FFIFunction f             ) = return $ FFIFunction f
 traverseImpFunction def fenv (ImpFunction name args body) = runISubstBuilderT env $ do
-  extendScope $ foldMap binderAsEnv args
+  extendScope $ foldMap (\(v,ty)->v@>HLift ty) args
   body' <- extendValSubst (foldMap argSub args) $ traverseImpBlock def body
   return $ ImpFunction name args body'
   where
-    argSub b = case b of
-      Ignore _ -> mempty
-      Bind   v -> v @> IVar v
+    argSub (v,_) = v @> HLift (IVar v)
     env = ISubstEnv mempty fenv
 
 traverseImpBlock :: Monad m => ITraversalDef m -> ImpBlock -> ISubstBuilderT m ImpBlock
@@ -131,22 +131,22 @@ traverseImpBlock def block = buildScoped $ evalImpBlock def block
 evalImpBlock :: Monad m => ITraversalDef m -> ImpBlock -> ISubstBuilderT m [IExpr]
 evalImpBlock def@(fDecl, _) (ImpBlock decls results) = do
   case decls of
-    Nest decl rest -> do
+    decl:rest -> do
       env' <- fDecl decl
       extendValSubst env' $ evalImpBlock def $ ImpBlock rest results
-    Empty -> traverse traverseIExpr results
+    [] -> traverse traverseIExpr results
 
-traverseImpDecl :: Monad m => ITraversalDef m -> ImpDecl -> ISubstBuilderT m (Env IExpr)
+traverseImpDecl :: Monad m => ITraversalDef m -> ImpDecl -> ISubstBuilderT m (SimpleEnv () IExpr)
 traverseImpDecl (_, fInstr) (ImpLet bs instr) = do
   vs <- bindM2 emitTo (traverse freshIVar bs) (fInstr instr)
-  return $ newEnv bs vs
+  return $ newSubst bs vs
 
 traverseImpInstr :: Monad m => ITraversalDef m -> ImpInstr -> ISubstBuilderT m ImpInstr
 traverseImpInstr def instr = case instr of
-  IFor dir b size body -> do
-    b' <- freshIVar b
-    IFor dir (Bind b') <$> traverseIExpr size
-                       <*> (extendValSubst (b @> IVar b') $ traverseImpBlock def body)
+  IFor dir (v,ty) size body -> do
+    v' <- freshIVar (v,ty)
+    IFor dir (v', ty) <$> traverseIExpr size
+                <*> (extendValSubst (v @> HLift (IVar v')) $ traverseImpBlock def body)
   IWhile body -> IWhile <$> traverseImpBlock def body
   ICond cond tb fb -> ICond <$> traverseIExpr cond
                             <*> traverseImpBlock def tb
@@ -170,19 +170,16 @@ traverseImpInstr def instr = case instr of
 
 traverseIExpr :: Monad m => IExpr -> ISubstBuilderT m IExpr
 traverseIExpr (ILit l) = return $ ILit l
-traverseIExpr (IVar v) = (!v) <$> asks valSubst
+traverseIExpr (IVar v) = fromHLift . (!v) <$> asks valSubst
 
 traverseIFunVar :: Monad m => IFunVar -> ISubstBuilderT m IFunVar
-traverseIFunVar fv = (!fv) <$> asks funcSubst
+traverseIFunVar fv = fromHLift . (!fst fv) <$> asks funcSubst
 
-freshIVar :: Monad m => IBinder -> IBuilderT m IVar
-freshIVar b = do
-  let nameHint = case b of
-                   Bind (name:>_) -> name
-                   Ignore _       -> "v"
-  name <- genFresh nameHint <$> looks scope
-  extendScope $ name @> ()
-  return $ name :> binderAnn b
+freshIVar :: (HasNameStr hint, Monad m) => (hint, IType) -> IBuilderT m IVar
+freshIVar (nameHint, ty) = do
+  name <- genFresh NormalName (getNameStr nameHint) <$> looks scope
+  extendScope $ name @> HUnit
+  return name
 
 buildScoped :: Monad m => IBuilderT m [IExpr] -> IBuilderT m ImpBlock
 buildScoped m = do
@@ -190,5 +187,9 @@ buildScoped m = do
   extend $ IBuilderEnv scopeExt mempty  -- Names are global in Imp IR
   return $ ImpBlock decls results
 
-extendValSubst :: Monad m => Env IExpr -> ISubstBuilderT m a -> ISubstBuilderT m a
+extendValSubst :: Monad m => SimpleEnv () IExpr
+               -> ISubstBuilderT m a -> ISubstBuilderT m a
 extendValSubst s = local (\env -> env { valSubst = valSubst env <> s })
+
+newSubst ::[IBinder] -> [IExpr] -> SimpleEnv i IExpr
+newSubst = undefined
